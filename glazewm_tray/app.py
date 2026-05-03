@@ -30,6 +30,8 @@ class GlazeTrayApp:
         self.error_count = 0
         self._lock = threading.Lock()
         self.window_count = 0
+        self.paused = False
+        self.binding_modes = []
 
         # WebSocket connections
         self._ws_sub = None
@@ -49,12 +51,12 @@ class GlazeTrayApp:
         self._last_state = None
 
     @staticmethod
-    def _load_font():
+    def _load_font(size=32):
         try:
-            return ImageFont.truetype("arialbd.ttf", 32)
+            return ImageFont.truetype("arialbd.ttf", size)
         except Exception:
             try:
-                return ImageFont.truetype("arial.ttf", 32)
+                return ImageFont.truetype("arial.ttf", size)
             except Exception:
                 return ImageFont.load_default()
 
@@ -86,6 +88,30 @@ class GlazeTrayApp:
                 self.error_count += 1
                 self.last_error = response.get('error', 'Query failed')
                 return
+
+            try:
+                paused_resp = self._ws_query("query paused")
+                if paused_resp.get('success'):
+                    pdata = paused_resp.get('data', {})
+                    if isinstance(pdata, bool):
+                        with self._lock:
+                            self.paused = pdata
+                    elif isinstance(pdata, dict):
+                        with self._lock:
+                            self.paused = bool(pdata.get('paused', pdata.get('isPaused', False)))
+            except Exception:
+                pass
+
+            try:
+                bm_resp = self._ws_query("query binding-modes")
+                if bm_resp.get('success'):
+                    bdata = bm_resp.get('data', [])
+                    modes = bdata.get('bindingModes', []) if isinstance(bdata, dict) else bdata
+                    names = [m.get('name', '') for m in modes if isinstance(m, dict)]
+                    with self._lock:
+                        self.binding_modes = [n for n in names if n]
+            except Exception:
+                pass
 
             data = response.get('data', {})
             new_ws_list = []
@@ -120,6 +146,7 @@ class GlazeTrayApp:
                         total_windows += len(windows)
                         new_ws_list.append({
                             "name": str(obj.get('name')),
+                            "displayName": obj.get('displayName') or '',
                             "focused": obj.get('hasFocus', False),
                             "resident": len(windows) > 0,
                             "windows": windows
@@ -161,7 +188,7 @@ class GlazeTrayApp:
                 print(f"Query Error: {e}")
 
     def create_icon_image(self):
-        """Draws a compact indicator of all active workspaces."""
+        """Draws an indicator for the focused workspace (or paused/error state)."""
         width, height = 64, 64
         img = Image.new('RGB', (width, height), config.COLORS["bg"])
         d = ImageDraw.Draw(img)
@@ -169,24 +196,54 @@ class GlazeTrayApp:
         font = self._font
 
         with self._lock:
-            active_ws = [ws for ws in self.all_workspaces if ws['resident'] or ws['focused']]
+            paused = self.paused
+            modes = list(self.binding_modes)
+            focused_ws = next((ws for ws in self.all_workspaces if ws['focused']), None)
 
-        if not active_ws:
-            if self.error_count > 3:
-                d.text((20, 15), "!", fill=config.COLORS["error"], font=font)
-            else:
-                d.text((20, 15), "?", fill=config.COLORS["text"], font=font)
+        if paused:
+            # Two vertical bars centered (pause glyph)
+            bar_w, bar_h = 10, 36
+            gap = 8
+            top = (height - bar_h) // 2
+            left = (width - (bar_w * 2 + gap)) // 2
+            d.rectangle([left, top, left + bar_w, top + bar_h], fill=config.COLORS["error"])
+            d.rectangle([left + bar_w + gap, top, left + bar_w * 2 + gap, top + bar_h],
+                        fill=config.COLORS["error"])
+            return img
+
+        boxed = bool(modes)
+        if boxed:
+            glyph = ''.join(m[:1] for m in modes if m).upper() or '?'
+            color = config.COLORS["active"]
+        elif not focused_ws:
+            glyph = "!" if self.error_count > 3 else "?"
+            color = config.COLORS["error"] if self.error_count > 3 else config.COLORS["text"]
         else:
-            x_offset = 6
-            for ws in active_ws[:3]:
-                color = config.COLORS["text"] if ws['resident'] else config.COLORS["inactive"]
-                d.text((x_offset, 12), ws['name'][:1], fill=color, font=font)
+            label = focused_ws.get('displayName') or focused_ws['name']
+            glyph = label[:1] if label else '?'
+            color = config.COLORS["text"]
 
-                if ws['focused']:
-                    d.rectangle([x_offset, 50, x_offset + 18, 56], fill=config.COLORS["active"])
+        # Pick a font that fits horizontally (multi-letter binding modes can be wide)
+        glyph_font = font
+        for size in (32, 28, 24, 20, 18, 14):
+            candidate = self._load_font(size)
+            bbox = d.textbbox((0, 0), glyph, font=candidate)
+            if bbox[2] - bbox[0] <= width - 12:
+                glyph_font = candidate
+                break
 
-                x_offset += 20
+        bbox = d.textbbox((0, 0), glyph, font=glyph_font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (width - tw) // 2 - bbox[0]
+        y = (height - th) // 2 - bbox[1]
+        d.text((x, y), glyph, fill=color, font=glyph_font)
 
+        if boxed:
+            margin = 4
+            d.rectangle(
+                [margin, margin, width - margin - 1, height - margin - 1],
+                outline=color, width=3,
+            )
         return img
 
     def run_cmd(self, cmd):
@@ -210,13 +267,15 @@ class GlazeTrayApp:
             with self._lock:
                 state_key = (
                     tuple(
-                        (ws['name'], ws['focused'], ws['resident'],
+                        (ws['name'], ws.get('displayName', ''), ws['focused'], ws['resident'],
                          tuple(w.get('title', '') for w in ws.get('windows', [])))
                         for ws in self.all_workspaces
                     ),
                     self.window_count,
                     self.error_count > 3,
                     self.last_error,
+                    self.paused,
+                    tuple(self.binding_modes),
                 )
             if state_key == self._last_state:
                 return
@@ -259,6 +318,20 @@ class GlazeTrayApp:
 
                     event_data = event.get('data', {})
                     event_type = event_data.get('eventType', '')
+
+                    if event_type == 'pause_changed':
+                        new_paused = event_data.get(
+                            'isPaused', event_data.get('paused', None)
+                        )
+                        if new_paused is not None:
+                            with self._lock:
+                                self.paused = bool(new_paused)
+
+                    if event_type == 'binding_modes_changed':
+                        modes = event_data.get('newBindingModes', []) or []
+                        names = [m.get('name', '') for m in modes if isinstance(m, dict)]
+                        with self._lock:
+                            self.binding_modes = [n for n in names if n]
 
                     self._last_event_time = time.time()
                     self._dirty = True
